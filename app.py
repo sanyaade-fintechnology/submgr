@@ -214,13 +214,20 @@ def modify_subscriptions(client, ticker_id, trades_speed, ob_speed, ob_levels):
     return old_sub, new_sub
 
 async def handle_subscribe(ident, client, msg):
+    required_fields = [
+        "ticker_id",
+        "order_book_speed",
+        "trades_speed",
+        "order_book_levels"
+    ]
+    check_missing(required_fields, msg["content"])
     msg["command"] = "subscribe"
     connector = msg.pop("connector")
     content = msg["content"]
     raw_ticker_id = content["ticker_id"]
-    trades_speed = content.get("trades_speed", 10)
-    ob_speed = content.get("order_book_speed", 10)
-    ob_levels = content.get("order_book_levels", 0)
+    trades_speed = content["trades_speed"]
+    ob_speed = content["order_book_speed"]
+    ob_levels = content["order_book_levels"]
     ticker_id = connector + "/" + content["ticker_id"]
     if ticker_id not in g.tickers:
         g.tickers[ticker_id] = {
