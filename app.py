@@ -364,13 +364,13 @@ def main():
     setup_logging(args)
     g.loop.run_until_complete(init_zmq_sockets(args))
     tasks = []
-    tasks.append(create_task(run_ctl_handler()))
-    tasks.append(create_task(run_client_reaper()))
+    tasks.append(run_ctl_handler())
+    tasks.append(run_client_reaper())
     for name, d in g.up.items():
-        tasks.append(create_task(d["sock_deal_pub"].run()))
-        coro_obj = run_multiplexing_subscriber(d["sock_sub"], name)
-        tasks.append(create_task(coro_obj))
+        tasks.append(d["sock_deal_pub"].run())
+        tasks.append(run_multiplexing_subscriber(d["sock_sub"], name))
         # tasks.append(create_task(remove_upstream_chain(name)))
+    tasks = [create_task(task) for task in tasks]
     g.loop.run_until_complete(asyncio.gather(*tasks))
 
 if __name__ == "__main__":
