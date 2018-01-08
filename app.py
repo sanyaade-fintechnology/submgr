@@ -341,6 +341,8 @@ async def init_get_connector_name(sock):
     return msg["content"][-1]["connector_name"]
 
 async def init_new_upstream_chain(ctl_addr, pub_addr):
+    L.info("initializing new upstream chain: CTL={}, PUB={} ..."
+           .format(ctl_addr, pub_addr))
     sock_deal = g.ctx.socket(zmq.DEALER)
     sock_deal.setsockopt_string(zmq.IDENTITY, MODULE_NAME)
     sock_deal.connect(ctl_addr)
