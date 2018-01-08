@@ -69,14 +69,6 @@ def partition(coll, n, step=None, complete_only=False):
         else:
             yield coll[i:i+n]
 
-def pack_msg(msg : dict):
-    if "msg_id" not in msg:
-        msg["msg_id"] = str(uuid.uuid4())
-    return (" " + json.dumps(msg)).encode()
-
-def unpack_msg(msg : bytes):
-    return json.loads(msg.decode())
-
 def merge_with(f, dicts):
     res = defaultdict(lambda: [])
     for d in dicts:
@@ -85,6 +77,30 @@ def merge_with(f, dicts):
     for k, v in res.items():
         res[k] = f(v)
     return dict(res)
+
+def pack_msg(msg : dict):
+    if "msg_id" not in msg:
+        msg["msg_id"] = str(uuid.uuid4())
+    return (" " + json.dumps(msg)).encode()
+
+def unpack_msg(msg : bytes):
+    return json.loads(msg.decode())
+
+async def send_recv_command_raw(sock, msg):
+    msg_bytes = pack_msg(msg)
+    msg_id = msg["msg_id"]
+    await sock.send_multipart([b"", msg_bytes])
+    # this will wipe the message queue
+    while True:
+        msg_parts = await sock.recv_multipart()
+        try:
+            msg = json.loads(msg_parts[-1].decode())
+            if msg["msg_id"] == msg_id:
+                break
+        except:
+            pass
+    error.check_message(msg)
+    return msg["content"]
 
 ###############################################################################
 
@@ -332,13 +348,25 @@ def setup_logging(args):
     setup_root_logger(args.log_level)
 
 async def init_get_connector_name(sock):
-    msg = { "command": "get_status" }
-    msg_bytes = pack_msg(msg)
-    await sock.send_multipart([b"", msg_bytes])
-    msg_parts = await sock.recv_multipart()
-    msg = json.loads(msg_parts[-1].decode())
-    error.check_message(msg)
-    return msg["content"][-1]["connector_name"]
+    msg = {"command": "get_status"}
+    return (await send_recv_command_raw(sock, msg))[-1]["connector_name"]
+
+async def unsubscribe_all(sock):
+    msg = { "command": "get_subscriptions" }
+    old_subscriptions = await send_recv_command_raw(sock, msg)
+    for ticker_id in old_subscriptions:
+        msg = {
+            "command": "subscribe",
+            "msg_id": str(uuid.uuid4()),
+            "content": {
+                "ticker_id": ticker_id,
+                "trades_speed": 0,
+                "order_book_speed": 0,
+                "order_book_levels": 0
+            }
+        }
+        L.info("unsubscribing old subscription: {}".format(ticker_id))
+        await send_recv_command_raw(sock, msg)
 
 async def init_new_upstream_chain(ctl_addr, pub_addr):
     L.info("initializing new upstream chain: CTL={}, PUB={} ..."
@@ -350,14 +378,17 @@ async def init_new_upstream_chain(ctl_addr, pub_addr):
     sock_sub.connect(pub_addr)
     sock_sub.subscribe(b"")
     name = await init_get_connector_name(sock_deal)
+    L.info("{}: ctl={}, pub={}".format(name, ctl_addr, pub_addr))
+    await unsubscribe_all(sock_deal)
     g.up[name] = d = {}
     d["sock_deal"] = sock_deal
     d["sock_deal_pub"] = SockRecvPublisher(g.ctx, sock_deal)
     d["sock_sub"] = sock_sub
-    L.info("{}: ctl={}, pub={}".format(name, ctl_addr, pub_addr))
 
 async def remove_upstream_chain(name):
+    L.info("removing upstream chain: {}".format(name))
     d = g.up.pop(name)
+    await unsubscribe_all(d["sock_deal"])
     await d["sock_deal_pub"].destroy()
     d["sock_deal"].close()
     d["sock_sub"].close()
