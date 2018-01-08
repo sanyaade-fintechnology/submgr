@@ -8,6 +8,7 @@ import json
 import argparse
 from zmapi.codes import error
 from zmapi.zmq import SockRecvPublisher
+from zmapi.logging import setup_root_logger
 import uuid
 from sortedcontainers import SortedDict
 from collections import defaultdict
@@ -28,7 +29,7 @@ class InvalidArgumentsException(Exception):
 
 ################################### GLOBALS ###################################
 
-L = None
+L = logging.root
 
 class GlobalState:
     pass
@@ -315,21 +316,8 @@ def parse_args():
         pass
     return args
 
-def build_logger(args):
-    logging.root.setLevel(args.log_level)
-    logger = logging.getLogger(__name__)
-    logger.propagate = False
-    logger.handlers.clear()
-    fmt = "%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s"
-    datefmt = "%H:%M:%S"
-    formatter = logging.Formatter(fmt=fmt, datefmt=datefmt)
-    # convert datetime to utc
-    formatter.converter = gmtime
-    handler = logging.StreamHandler(stream=sys.stdout)
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
-    return logger
-
+def setup_logging(args):
+    setup_root_logger(args.log_level)
 
 async def init_get_connector_name(sock):
     msg = { "command": "get_status" }
@@ -373,7 +361,7 @@ async def init_zmq_sockets(args):
 def main():
     global L
     args = parse_args()
-    L = build_logger(args)
+    setup_logging(args)
     g.loop.run_until_complete(init_zmq_sockets(args))
     tasks = []
     tasks.append(create_task(run_ctl_handler()))
