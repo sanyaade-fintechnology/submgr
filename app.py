@@ -9,6 +9,7 @@ import argparse
 from zmapi.codes import error
 from zmapi.zmq import SockRecvPublisher
 from zmapi.logging import setup_root_logger
+from zmapi.utils import check_missing
 import uuid
 from sortedcontainers import SortedDict
 from collections import defaultdict
@@ -268,6 +269,8 @@ async def handle_ctl_msg_1(ident, msg, client):
         debug_msg += " connector={}".format(msg["connector"])
     L.debug("> " + debug_msg)
     try:
+        if cmd not in ["get_status"]:
+            check_missing("connector", msg)
         # TODO: add support for `add_connector` and `remove_connector` commands
         if cmd == "get_status":
             await get_status(ident, msg)
