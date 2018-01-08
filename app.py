@@ -260,10 +260,12 @@ async def fwd_message_no_change(ident, msg):
 async def handle_ctl_msg_1(ident, msg, client):
     msg_id = msg["msg_id"]
     cmd = msg["command"]
-    debug_msg = "ident={}, command={}, connector={}"
+    debug_msg = "ident={}, command={}, msg_id={}"
     debug_msg = debug_msg.format(ident_to_str(ident),
                                  cmd,
-                                 msg.get("connector"))
+                                 msg_id)
+    if "connector" in msg:
+        debug_msg += " connector={}".format(msg["connector"])
     L.debug("> " + debug_msg)
     try:
         # TODO: add support for `add_connector` and `remove_connector` commands
