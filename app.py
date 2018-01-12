@@ -20,8 +20,6 @@ from datetime import datetime
 ################################## CONSTANTS ##################################
 
 MODULE_NAME = "submgr"
-REAPER_INTERVAL = 60
-REAPER_MAX_HEARTBEATS = 3
 
 ################################# EXCEPTIONS ##################################
 
@@ -107,7 +105,8 @@ async def send_recv_command_raw(sock, msg):
 async def reap_client(client, d):
     ticker_ids = list(d["subscriptions"].keys())
     for ticker_id in ticker_ids:
-        old_sub, new_sub = modify_subscriptions(client, ticker_id, 0, 0, 0)
+        old_sub, new_sub = modify_subscriptions(
+                client, ticker_id, 0, 0, 0, False)
         if old_sub != new_sub:
             spl = ticker_id.split("/")
             connector = spl[0]
@@ -137,7 +136,7 @@ async def run_client_reaper():
                 L.info("reaping client {}".format(client))
                 await reap_client(client, d)
                 L.info("reaped client {}".format(client))
-        await asyncio.sleep(REAPER_INTERVAL)
+        await asyncio.sleep(g.reaper_interval)
 
 ###############################################################################
 
@@ -161,9 +160,9 @@ async def run_ctl_handler():
         if client not in g.clients:
             g.clients[client] = {
                 "subscriptions": {},
-                "health": REAPER_MAX_HEARTBEATS
+                "health": g.reaper_max_heartbeats
             }
-        g.clients[client]["health"] = REAPER_MAX_HEARTBEATS
+        g.clients[client]["health"] = g.reaper_max_heartbeats
         if len(msg) == 0:
             # Ping message is not forwarded to upstream branches.
             # Ping messages are used here to signal that the client is alive.
@@ -192,40 +191,50 @@ async def get_status(ident, msg):
         "num_clients": len(g.clients),
         "num_subscribed_tickers": sum([bool(x["subscriptions"])
                                       for x in g.tickers.values()]),
-        "reaper_interval": REAPER_INTERVAL,
-        "reaper_max_heartbeats": REAPER_MAX_HEARTBEATS,
+        "reaper_interval": g.reaper_interval,
+        "reaper_max_heartbeats": g.reaper_max_heartbeats,
     }
     content = [status, res]
     msg_orig["content"] = content
     await g.sock_ctl.send_multipart(ident + [b"", pack_msg(msg_orig)])
 
-def modify_subscriptions(client, ticker_id, trades_speed, ob_speed, ob_levels):
+def sum_and_maybe_booleanize(xs):
+    res = sum(xs)
+    if type(xs[0]) is bool:
+        return bool(res)
+    return res
+
+def modify_subscriptions(client, ticker_id, trades_speed, ob_speed, ob_levels,
+                         emit_quotes):
     t_d = g.tickers[ticker_id]["subscriptions"]
     c_d = g.clients[client]["subscriptions"]
-    old_sub = merge_with(sum, t_d.values())
+    old_sub = merge_with(sum_and_maybe_booleanize, t_d.values())
     if not old_sub:
         old_sub = {
             "trades_speed": 0,
             "order_book_speed": 0,
             "order_book_levels": 0,
+            "emit_quotes": False,
         }
-    if trades_speed == 0 and ob_speed == 0:  # unsubscribe
+    if trades_speed == 0 and ob_speed == 0 and not emit_quotes:  # unsubscribe
         c_d.pop(ticker_id, None)
         t_d.pop(client, None)
     else:
         sub = {
             "trades_speed": trades_speed,
             "order_book_speed": ob_speed,
-            "order_book_levels": ob_levels
+            "order_book_levels": ob_levels,
+            "emit_quotes": emit_quotes,
         }
         c_d[ticker_id] = sub
         t_d[client] = sub
-    new_sub = merge_with(sum, t_d.values())
+    new_sub = merge_with(sum_and_maybe_booleanize, t_d.values())
     if not new_sub:
         new_sub = {
             "trades_speed": 0,
             "order_book_speed": 0,
             "order_book_levels": 0,
+            "emit_quotes": False,
         }
     return old_sub, new_sub
 
@@ -244,13 +253,14 @@ async def handle_subscribe(ident, client, msg):
     trades_speed = content["trades_speed"]
     ob_speed = content["order_book_speed"]
     ob_levels = content["order_book_levels"]
+    emit_quotes = content["emit_quotes"]
     ticker_id = connector + "/" + content["ticker_id"]
     if ticker_id not in g.tickers:
         g.tickers[ticker_id] = {
             "subscriptions": {}
         }
     old_sub, new_sub = modify_subscriptions(
-            client, ticker_id, trades_speed, ob_speed, ob_levels)
+            client, ticker_id, trades_speed, ob_speed, ob_levels, emit_quotes)
     if old_sub == new_sub:
         msg["content"] = {}
         await g.sock_ctl.send_multipart(ident + [b"", pack_msg(msg)])
@@ -260,6 +270,9 @@ async def handle_subscribe(ident, client, msg):
     content["trades_speed"] = new_sub["trades_speed"]
     content["order_book_speed"] = new_sub["order_book_speed"]
     content["order_book_levels"] = new_sub["order_book_levels"]
+    content["emit_quotes"] = new_sub["emit_quotes"]
+    L.info("changed subscription on {}:\n{}"
+           .format(ticker_id, pformat(new_sub)))
     up_d = g.up[connector]
     await up_d["sock_deal"].send_multipart(ident + [b"", pack_msg(msg)])
     msg_parts = await up_d["sock_deal_pub"].poll_for_msg_id(msg["msg_id"])
@@ -336,6 +349,10 @@ def parse_args():
     parser.add_argument("upstream_addresses", nargs="+",
                         help="pairs of ctl and pub addresses representing "
                              "connected upstream branches")
+    parser.add_argument("--reaper-interval", type=int, default=60,
+                        help="reaper interval")
+    parser.add_argument("--reaper-max-hb", type=int, default=3,
+                        help="reaper max heartbeats")
     parser.add_argument("--log-level", default="INFO", help="logging level")
     args = parser.parse_args()
     try:
@@ -406,6 +423,8 @@ async def init_zmq_sockets(args):
 def main():
     global L
     args = parse_args()
+    g.reaper_interval = args.reaper_interval
+    g.reaper_max_heartbeats = args.reaper_max_hb
     setup_logging(args)
     g.loop.run_until_complete(init_zmq_sockets(args))
     tasks = []
