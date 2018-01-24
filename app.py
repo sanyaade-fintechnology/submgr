@@ -10,12 +10,14 @@ from zmapi.codes import error
 from zmapi.zmq import SockRecvPublisher
 from zmapi.logging import setup_root_logger
 from zmapi.utils import check_missing
+from zmapi import SubscriptionDefinition
 import uuid
 from sortedcontainers import SortedDict
 from collections import defaultdict
 from time import gmtime
 from pprint import pprint, pformat
 from datetime import datetime
+from copy import deepcopy
 
 ################################## CONSTANTS ##################################
 
@@ -37,8 +39,18 @@ g.loop = asyncio.get_event_loop()
 g.ctx = zmq.asyncio.Context()
 g.startup_time = datetime.utcnow()
 g.pub_bytes = defaultdict(lambda: 0)
-g.clients = {}
-g.tickers = {}
+
+# info for each client_id, subscriptions are indexed by full ticker_id
+def new_clients_value():
+    d = {"subscriptions": defaultdict(SubscriptionDefinition)}
+    return d
+g.clients = defaultdict(new_clients_value)
+
+# info for each full ticker_id, subscriptions are indexed by client_id
+def new_tickers_value():
+    d = {"subscriptions": defaultdict(SubscriptionDefinition)}
+    return d
+g.tickers = defaultdict(new_tickers_value)
 
 ################################### HELPERS ###################################
 
@@ -76,8 +88,9 @@ def merge_with(f, dicts):
         res[k] = f(v)
     return dict(res)
 
+# mutates msg
 def pack_msg(msg : dict):
-    if "msg_id" not in msg:
+    if not msg.get("msg_id"):
         msg["msg_id"] = str(uuid.uuid4())
     return (" " + json.dumps(msg)).encode()
 
@@ -105,25 +118,9 @@ async def send_recv_command_raw(sock, msg):
 async def reap_client(client, d):
     ticker_ids = list(d["subscriptions"].keys())
     for ticker_id in ticker_ids:
-        old_sub, new_sub = modify_subscriptions(
-                client, ticker_id, 0, 0, 0, False)
-        if old_sub != new_sub:
-            spl = ticker_id.split("/")
-            connector = spl[0]
-            ticker_id = "/".join(spl[1:])
-            msg = {}
-            msg["command"] = "subscribe"
-            msg["msg_id"] = msg_id = str(uuid.uuid4())
-            msg["content"] = content = {}
-            content["ticker_id"] = ticker_id
-            content["trades_speed"] = 0
-            content["order_book_speed"] = 0
-            content["order_book_levels"] = 0
-            up_d = g.up[connector]
-            await up_d["sock_deal"].send_multipart([b"", pack_msg(msg)])
-            msg_parts = await up_d["sock_deal_pub"].poll_for_msg_id(msg_id)
-            msg = unpack_msg(msg_parts[-1])
-            error.check_message(msg)
+        msg = await update_subscription(
+                client, ticker_id, SubscriptionDefinition())
+        error.check_message(msg)
     del g.clients[client]
 
 async def run_client_reaper():
@@ -134,7 +131,10 @@ async def run_client_reaper():
             d["health"] -= 1
             if d["health"] <= 0:
                 L.info("reaping client {}".format(client))
-                await reap_client(client, d)
+                try:
+                    await reap_client(client, d)
+                except RemoteException as err:
+                    L.exception("error when reaping client {}:".format(client))
                 L.info("reaped client {}".format(client))
         await asyncio.sleep(g.reaper_interval)
 
@@ -204,86 +204,67 @@ def sum_and_maybe_booleanize(xs):
         return bool(res)
     return res
 
-def modify_subscriptions(client, ticker_id, trades_speed, ob_speed, ob_levels,
-                         emit_quotes):
+async def update_subscription(client, ticker_id, sd, msg_id=None):
     t_d = g.tickers[ticker_id]["subscriptions"]
     c_d = g.clients[client]["subscriptions"]
-    old_sub = merge_with(sum_and_maybe_booleanize, t_d.values())
-    if not old_sub:
-        old_sub = {
-            "trades_speed": 0,
-            "order_book_speed": 0,
-            "order_book_levels": 0,
-            "emit_quotes": False,
-        }
-    if trades_speed == 0 and ob_speed == 0 and not emit_quotes:  # unsubscribe
+    old_sub = merge_with(sum_and_maybe_booleanize,
+                         [x.__dict__ for x in t_d.values()])
+    old_sub = SubscriptionDefinition(**old_sub)
+    c_d[ticker_id] = sd
+    t_d[client] = sd
+    new_sub = merge_with(sum_and_maybe_booleanize,
+            [x.__dict__ for x in t_d.values()])
+    new_sub = SubscriptionDefinition(**new_sub)
+    if new_sub.empty():
         c_d.pop(ticker_id, None)
         t_d.pop(client, None)
-    else:
-        sub = {
-            "trades_speed": trades_speed,
-            "order_book_speed": ob_speed,
-            "order_book_levels": ob_levels,
-            "emit_quotes": emit_quotes,
-        }
-        c_d[ticker_id] = sub
-        t_d[client] = sub
-    new_sub = merge_with(sum_and_maybe_booleanize, t_d.values())
-    if not new_sub:
-        new_sub = {
-            "trades_speed": 0,
-            "order_book_speed": 0,
-            "order_book_levels": 0,
-            "emit_quotes": False,
-        }
-    return old_sub, new_sub
+    print(client, ticker_id)
+    pprint(old_sub)
+    pprint(new_sub)
+    if old_sub == new_sub:
+        content = {}
+        content["trades"] = "registered to manager, no change required"
+        content["order_book"] = "registered to manager, no change required"
+        return {"content": content}
+    L.info("{}: {} ({} subscribers)".format(ticker_id, new_sub, len(t_d)))
+    spl = ticker_id.split("/")
+    connector = spl[0]
+    raw_ticker_id = "/".join(spl[1:])
+    up_d = g.up[connector]
+    content = {"ticker_id": raw_ticker_id}
+    content.update(new_sub.__dict__)
+    msg = {
+        "content": content,
+        "msg_id": msg_id,
+        "command": "modify_subscription",
+    }
+    await up_d["sock_deal"].send_multipart([b"", pack_msg(msg)])
+    msg_parts = await up_d["sock_deal_pub"].poll_for_msg_id(msg["msg_id"])
+    msg = json.loads(msg_parts[-1].decode())
+    return msg
 
-async def handle_subscribe(ident, client, msg):
-    required_fields = [
-        "ticker_id",
-        "order_book_speed",
-        "trades_speed",
-        "order_book_levels"
-    ]
-    check_missing(required_fields, msg["content"])
+async def handle_modify_subscription(ident, client, msg):
+    msg_id = msg["msg_id"]
     msg["command"] = "subscribe"
     connector = msg.pop("connector")
     content = msg["content"]
     raw_ticker_id = content["ticker_id"]
-    trades_speed = content["trades_speed"]
-    ob_speed = content["order_book_speed"]
-    ob_levels = content["order_book_levels"]
-    emit_quotes = content["emit_quotes"]
-    ticker_id = connector + "/" + content["ticker_id"]
-    if ticker_id not in g.tickers:
-        g.tickers[ticker_id] = {
-            "subscriptions": {}
-        }
-    old_sub, new_sub = modify_subscriptions(
-            client, ticker_id, trades_speed, ob_speed, ob_levels, emit_quotes)
+    ticker_id = connector + "/" + raw_ticker_id
+    old_sub = g.tickers[ticker_id]["subscriptions"][client]
+    new_sub = deepcopy(old_sub)
+    new_sub.update(content)
+    if old_sub != new_sub:
+        msg = await update_subscription(client, ticker_id, new_sub)
     if old_sub == new_sub:
-        msg["content"] = {}
-        await g.sock_ctl.send_multipart(ident + [b"", pack_msg(msg)])
-        return
-    msg["content"] = content = {}
-    content["ticker_id"] = raw_ticker_id
-    content["trades_speed"] = new_sub["trades_speed"]
-    content["order_book_speed"] = new_sub["order_book_speed"]
-    content["order_book_levels"] = new_sub["order_book_levels"]
-    content["emit_quotes"] = new_sub["emit_quotes"]
-    L.info("changed subscription on {}:\n{}"
-           .format(ticker_id, pformat(new_sub)))
-    up_d = g.up[connector]
-    await up_d["sock_deal"].send_multipart(ident + [b"", pack_msg(msg)])
-    msg_parts = await up_d["sock_deal_pub"].poll_for_msg_id(msg["msg_id"])
-    await g.sock_ctl.send_multipart(msg_parts)
+        content = {"trades": "no change", "order_book": "no change"}
+        msg = {"content": content}
+    msg["msg_id"] = msg_id
+    await g.sock_ctl.send_multipart(ident + [b"", pack_msg(msg)])
 
 async def handle_unsubscribe(ident, client, msg):
     content = msg["content"]
-    content["trades_speed"] = 0
-    content["order_book_speed"] = 0
-    content["order_book_levels"] = 0
-    await handle_subscribe(ident, client, msg)
+    content.update(SubscriptionDefinition().__dict__)
+    await handle_modify_subscription(ident, client, msg)
 
 async def fwd_message_no_change(ident, msg):
     connector = msg.pop("connector")
@@ -310,8 +291,8 @@ async def handle_ctl_msg_1(ident, msg, client):
         # TODO: add support for `add_connector` and `remove_connector` commands
         if cmd == "get_status":
             await get_status(ident, msg)
-        elif cmd == "subscribe":
-            await handle_subscribe(ident, client, msg)
+        elif cmd == "modify_subscription":
+            await handle_modify_subscription(ident, client, msg)
         elif cmd == "unsubscribe":
             await handle_unsubscribe(ident, client, msg)
         else:
@@ -324,7 +305,6 @@ async def handle_ctl_msg_1(ident, msg, client):
         await send_error(ident, msg_id, error.GENERIC, str(e))
     L.debug("< " + debug_msg)
 
-
 ###############################################################################
 
 async def run_multiplexing_subscriber(sock_sub, connector : str):
@@ -335,7 +315,7 @@ async def run_multiplexing_subscriber(sock_sub, connector : str):
         msg_parts = await sock_sub.recv_multipart()
         g.pub_bytes[connector] += len(msg_parts[1])
         msg_parts[0] = connector_bytes + b"/" + msg_parts[0]
-        g.sock_pub.send_multipart(msg_parts)
+        await g.sock_pub.send_multipart(msg_parts)
 
 ###############################################################################
 
@@ -372,16 +352,10 @@ async def unsubscribe_all(sock):
     msg = { "command": "get_subscriptions" }
     old_subscriptions = await send_recv_command_raw(sock, msg)
     for ticker_id in old_subscriptions:
-        msg = {
-            "command": "subscribe",
-            "msg_id": str(uuid.uuid4()),
-            "content": {
-                "ticker_id": ticker_id,
-                "trades_speed": 0,
-                "order_book_speed": 0,
-                "order_book_levels": 0
-            }
-        }
+        msg = {"command": "modify_subscription"}
+        content = {"ticker_id": ticker_id}
+        content.update(SubscriptionDefinition().__dict__)
+        msg["content"] = content
         L.info("unsubscribing old subscription: {}".format(ticker_id))
         await send_recv_command_raw(sock, msg)
 
